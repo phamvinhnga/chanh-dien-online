@@ -97,6 +97,9 @@ button.red{background:var(--red);border-color:#b84a33}
       <label>Độ trầm (Hz)<input id="pitch" type="number" step="1" value="-18"></label>
       <label>Tốc độ (%)<input id="rate" type="number" step="1" value="-20"></label>
     </div>
+    <label for="proxyKey">Key proxy xoay cho giọng đọc (TopProxy / proxyxoay.shop)</label>
+    <div class="row"><input id="proxyKey" type="password" placeholder="Dán key vào đây" autocomplete="off"><button class="primary" id="btnProxy">Lưu &amp; thử</button><button id="btnProxyOff">Tắt proxy</button></div>
+    <p class="hint" id="proxyStatus">Đang gọi thẳng Microsoft (không proxy)</p>
     <label for="sayText">Đọc thử / phát thông báo</label>
     <textarea id="sayText">Nam mô Bổn Sư Thích Ca Mâu Ni Phật. Nguyện cầu cho tất cả chư vị Phật tử thân tâm thường an lạc, vạn sự cát tường.</textarea>
     <div class="row"><button class="primary" id="btnSay">Phát lên live</button><button id="btnChant">Đọc kinh định kỳ ngay</button></div>
@@ -146,6 +149,11 @@ function setTT(st){
   const el=$('tt'); el.className='chip ' + (st.status==='connected'?'ok':st.status==='error'?'bad':'');
   el.textContent = st.status==='connected' ? `TikTok: @${st.uniqueId} ✓` : st.status==='connecting' ? `TikTok: đang kết nối @${st.uniqueId}…` : st.status==='error' ? 'TikTok: lỗi kết nối' : 'TikTok: chưa kết nối';
 }
+function setProxy(p){
+  $('proxyStatus').textContent = p.mode==='fixed' ? `Proxy cố định (đặt lúc chạy server)${p.proxy ? ': ' + p.proxy : ''}`
+    : p.mode==='key' ? `Key ${p.key} · ` + (p.proxy ? `đang dùng proxy ${p.proxy}${p.message ? ' (' + p.message + ')' : ''}` : `chưa lấy được proxy${p.message ? ': ' + p.message : ''}, đang gọi thẳng`)
+    : 'Đang gọi thẳng Microsoft (không proxy)';
+}
 function connect(){
   ws = new WebSocket(`ws://${location.host}/ws?role=control`);
   ws.onopen = () => { $('srv').textContent='Server: đang chạy'; $('srv').className='chip ok'; };
@@ -160,6 +168,7 @@ function connect(){
     else if (m.t==='leave'){ people.delete(m.id); renderPeople(); }
     else if (m.t==='gift'){ const p=people.get(m.id); if(p){ p.coins=m.total; renderPeople(); } }
     else if (m.t==='bots') $('btnBots').textContent = m.on ? 'Tắt bot' : 'Bật bot';
+    else if (m.t==='proxy') setProxy(m);
   };
 }
 connect();
@@ -175,6 +184,8 @@ $('btnClear').onclick = () => send('clear');
 $('btnBots').onclick = () => send('bots', { on: $('btnBots').textContent.includes('Bật'), n: +$('botN').value, pace: $('botPace').value });
 $('btnSay').onclick = () => send('say', { text: $('sayText').value });
 $('btnChant').onclick = () => send('chant');
+$('btnProxy').onclick = () => { send('proxyKey', { key: $('proxyKey').value }); $('proxyKey').value = ''; $('proxyStatus').textContent = 'Đang thử key…'; };
+$('btnProxyOff').onclick = () => send('proxyKey', { key: '' });
 $('btnBell').onclick = () => send('bell');
 $('btnMo').onclick = () => send('mo');
 for (const k of SETTING_IDS) $(k).addEventListener('change', () => send('settings', { settings: readSettings() }));

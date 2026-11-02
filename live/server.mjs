@@ -6,7 +6,9 @@
 //   cd live && npm install && node server.mjs        → http://localhost:3000/live/control.html
 //
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
@@ -59,7 +61,10 @@ const DEFAULT_SKINS = ['man', 'woman', 'woman', 'man', 'granny'];
 function pub(v){ return { id:v.id, name:v.name, skin:v.skin, avatar:v.avatar||'', coins:v.coins, demo:!!v.demo }; }
 function snapshot(){ return { t:'state', settings, viewers:[...viewers.values()].map(pub), cap: capacity(), startedAt, tiktok: tiktokState }; }
 
+// TikTok events sometimes come without uniqueId/userId
+const viewerId = (id, name) => String(id ?? '') || 'anon_' + String(name || '');
 function seat(id, name, opts = {}){
+  id = viewerId(id, name);
   let v = viewers.get(id);
   if (v){ v.lastAt = Date.now(); if (opts.avatar) v.avatar = opts.avatar; return { v, isNew:false }; }
   if (viewers.size >= 100){                     // full: the longest-quiet non-donor stands up
@@ -76,6 +81,7 @@ function seat(id, name, opts = {}){
 
 /* ------------------------------------------------------------- events in */
 function onChat(id, name, text, avatar){
+  id = viewerId(id, name);
   text = String(text || '').slice(0, 120);
   const want = skinFromText(text);
   const { v, isNew } = seat(id, name, { avatar, skin: want || undefined });
@@ -86,6 +92,7 @@ function onChat(id, name, text, avatar){
 }
 
 function onGift(id, name, giftName, count, diamonds, avatar){
+  id = viewerId(id, name);
   giftName = String(giftName || 'quà').slice(0, 30); count = Math.max(1, Math.min(9999, +count || 1));
   const { v } = seat(id, name, { avatar });
   if (!v) return;
@@ -109,23 +116,104 @@ const spoken = s => String(s).replace(/[_@.]+/g, ' ').replace(/[^\p{L}\p{N}\s]/g
 const ttsQueue = []; let ttsBusy = false, ttsSeq = 0;
 function esc(s){ return String(s).replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&apos;'}[c])); }
 function say(text, meta = {}){ if (ttsQueue.length >= 15) { addLog('Hàng đợi giọng đọc đầy, bỏ qua 1 câu'); return; } ttsQueue.push({ text: String(text).slice(0, 500), meta }); pumpTTS(); }
-async function pumpTTS(){
-  if (ttsBusy || !ttsQueue.length) return; ttsBusy = true;
-  const { text, meta } = ttsQueue.shift();
+// Optional proxy for the Edge voice (Microsoft may throttle one home IP):
+//   TTS_PROXY      fixed proxy, "http://user:pass@host:port" or "host:port:user:pass"
+//   TTS_PROXY_KEY  TopProxy / proxyxoay.shop rotating key; a fresh IP is fetched every 70 s or after a failed call
+// The key can also be entered on the control panel; it is kept in live/.env.local (git-ignored, never served,
+// never sent to overlays) so it survives a restart.
+const proxyUrl = raw => { const s = String(raw).trim().replace(/:+$/, ''); if (/^\w+:\/\//.test(s)) return s;
+  const [h, p, u, pw] = s.split(':'); return u ? `http://${encodeURIComponent(u)}:${encodeURIComponent(pw || '')}@${h}:${p}` : `http://${h}:${p}`; };
+const maskProxy = u => String(u).replace(/\/\/[^@]*@/, '//***@');
+const maskKey = k => k ? (k.length > 8 ? `${k.slice(0, 4)}…${k.slice(-3)}` : '***') : '';
+const LOCAL_ENV = path.join(__dirname, '.env.local');
+const savedKey = (() => { try { return (fs.readFileSync(LOCAL_ENV, 'utf8').match(/^TTS_PROXY_KEY=(.*)$/m) || [])[1]?.trim() || ''; } catch { return ''; } })();
+const ttsProxy = { fixed: process.env.TTS_PROXY || '', key: process.env.TTS_PROXY_KEY || savedKey, url: '', at: 0, failAt: 0, Agent: null, message: '',
+  status(){ return { t:'proxy', mode: this.fixed ? 'fixed' : this.key ? 'key' : 'off', key: maskKey(this.key), proxy: this.url ? maskProxy(this.url) : '', message: this.message }; },
+  report(){ broadcast(this.status(), 'control'); },
+  async setKey(key){
+    this.key = String(key || '').trim().slice(0, 200); this.url = ''; this.at = 0; this.failAt = 0; this.message = '';
+    try { fs.writeFileSync(LOCAL_ENV, this.key ? `TTS_PROXY_KEY=${this.key}\n` : ''); } catch (e) { addLog('Không lưu được key proxy: ' + e.message); }
+    addLog(this.key ? `Đã đặt key proxy xoay ${maskKey(this.key)}` : 'Đã tắt proxy giọng đọc, gọi thẳng Microsoft');
+    if (this.key) await this.agent(true); else this.report();
+  },
+  async agent(rotate = false){
+    if (!this.fixed && !this.key) return null;
+    if (!this.fixed && !this.url && Date.now() - this.failAt < 60_000) return null;   // bad key / API down: go direct for a minute
+    this.Agent ||= (await import('https-proxy-agent')).HttpsProxyAgent;
+    if (this.fixed) { this.url ||= proxyUrl(this.fixed); return new this.Agent(this.url); }
+    if (rotate || !this.url || Date.now() - this.at > 70_000) {
+      try {
+        const ip = (await (await fetch('https://api.ipify.org?format=json', { signal: AbortSignal.timeout(5000) })).json()).ip || '';
+        const res = await fetch(`https://proxyxoay.shop/api/get.php?key=${encodeURIComponent(this.key)}&nhamang=random&tinhthanh=0&whitelist=${encodeURIComponent(ip)}`,
+          { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(15_000) });
+        const d = await res.json(); const raw = d.proxyhttp || d.proxy_http;
+        if (raw) { this.url = proxyUrl(raw); this.at = Date.now(); this.message = d['Vi Tri'] || 'đang dùng'; addLog(`Proxy giọng đọc: ${maskProxy(this.url)}${d['Vi Tri'] ? ' (' + d['Vi Tri'] + ')' : ''}`); }
+        else { this.message = d.message || 'status ' + d.status; if (!this.url) { this.failAt = Date.now(); addLog(`Không lấy được proxy xoay: ${this.message}`); } }
+      } catch (e) { this.message = e.message; if (!this.url) { this.failAt = Date.now(); addLog('Không lấy được proxy xoay: ' + e.message); } }
+      this.report();
+    }
+    return this.url ? new this.Agent(this.url) : null;
+  } };
+async function edgeTTS(text, agent = null){
+  const tts = new MsEdgeTTS(agent ? { agent } : undefined);
   try {
-    const file = `tts_${Date.now()}_${++ttsSeq}.mp3`;
-    const tts = new MsEdgeTTS();
     await tts.setMetadata(settings.voice, OUTPUT_FORMAT.AUDIO_24KHZ_96KBITRATE_MONO_MP3);
     const { audioStream } = tts.toStream(esc(text), { pitch: `${settings.pitch >= 0 ? '+' : ''}${settings.pitch}Hz`, rate: `${settings.rate >= 0 ? '+' : ''}${settings.rate}%` });
     const chunks = [];
     await new Promise((res, rej) => { audioStream.on('data', c => chunks.push(c)); audioStream.on('close', res); audioStream.on('error', rej); });
-    try { tts.close(); } catch {}
-    fs.writeFileSync(path.join(TTS_DIR, file), Buffer.concat(chunks));
+    return Buffer.concat(chunks);
+  } finally { try { tts.close(); } catch {} }
+}
+async function pumpTTS(){
+  if (ttsBusy || !ttsQueue.length) return; ttsBusy = true;
+  const { text, meta } = ttsQueue.shift();
+  let audio = null, ext = 'mp3', lastErr = null;
+  // the free Edge endpoint often drops the stream before the first byte: retry (through the proxy, on a fresh
+  // proxy IP after a failure, last try direct), then fall back to local ZeroTTS
+  for (let attempt = 0; attempt < 3 && !audio; attempt++) {
+    const agent = attempt < 2 ? await ttsProxy.agent(attempt > 0) : null;
+    try { audio = await edgeTTS(text, agent); } catch (e) { lastErr = e; await new Promise(r => setTimeout(r, 800)); }
+  }
+  if (!audio && zeroTTS.ready) {
+    try { audio = await zeroTTS.synth(text); ext = 'wav'; addLog('Giọng Edge lỗi, đã đọc bằng giọng dự phòng ZeroTTS'); }
+    catch (e) { lastErr = e; }
+  }
+  if (audio) {
+    const file = `tts_${Date.now()}_${++ttsSeq}.${ext}`;
+    fs.writeFileSync(path.join(TTS_DIR, file), audio);
     broadcast({ t:'tts', url: `/live/tts/${file}`, text, ...meta });
     const old = fs.readdirSync(TTS_DIR).sort(); while (old.length > 40) { try { fs.unlinkSync(path.join(TTS_DIR, old.shift())); } catch {} }
-  } catch (e) { addLog('TTS lỗi: ' + (e?.message || e)); }
+  } else addLog('TTS lỗi: ' + (lastErr?.message || lastErr));
   ttsBusy = false; setTimeout(pumpTTS, 50);
 }
+
+// Optional offline fallback voice: set ZEROTTS_DIR to a folder holding tts_worker.py and a .venv with zerotts installed
+// (see tiktok-live-temple-rpc). The worker reads {"id","text","voice"} lines on stdin and answers JSON lines on stdout.
+const zeroTTS = { ready: false, proc: null, pending: new Map(), seq: 0, buf: '', dir: process.env.ZEROTTS_DIR || '',
+  start(){
+    const py = path.join(this.dir, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+    const script = path.join(this.dir, 'tts_worker.py');
+    if (!this.dir || !fs.existsSync(py) || !fs.existsSync(script)) return;
+    this.proc = spawn(py, [script], { cwd: this.dir, env: { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' }, stdio: ['pipe', 'pipe', 'ignore'] });
+    this.proc.stdout.on('data', c => {
+      this.buf += c.toString('utf8'); const lines = this.buf.split('\n'); this.buf = lines.pop();
+      for (const l of lines) { let m; try { m = JSON.parse(l); } catch { continue; }
+        if (m.type === 'ready') { this.ready = true; addLog(`Giọng dự phòng ZeroTTS sẵn sàng (${m.voice})`); }
+        else if (m.type === 'result') { const p = this.pending.get(m.id); if (p) { this.pending.delete(m.id); p(m); } } }
+    });
+    this.proc.on('exit', () => { this.ready = false; for (const p of this.pending.values()) p({ ok:false, error:'ZeroTTS worker exited' }); this.pending.clear(); });
+  },
+  synth(text){
+    return new Promise((resolve, reject) => {
+      const id = ++this.seq;
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error('ZeroTTS timeout')); }, 30_000);
+      this.pending.set(id, m => { clearTimeout(timer);
+        if (!m.ok) return reject(new Error(m.error || 'ZeroTTS failed'));
+        try { resolve(fs.readFileSync(path.join(this.dir, 'data', 'tts-cache', m.file))); } catch (e) { reject(e); } });
+      this.proc.stdin.write(JSON.stringify({ id, text, voice: 'maichi' }) + '\n');
+    });
+  } };
+zeroTTS.start();
 
 const CHANTS = [
   'Nam mô Bổn Sư Thích Ca Mâu Ni Phật. Nguyện đem công đức này, hướng về khắp tất cả, đệ tử và chúng sinh, đều trọn thành Phật đạo.',
@@ -148,7 +236,8 @@ async function connectTikTok(uniqueId){
   try {
     TikTokLib ||= await import('tiktok-live-connector');
     const { TikTokLiveConnection, WebcastEvent, ControlEvent } = TikTokLib;
-    const conn = new TikTokLiveConnection(uniqueId, { enableExtendedGiftInfo: true, processInitialData: false });
+    // extended gift info and room-info-on-connect need a paid EulerStream plan; giftDetails already carries diamondCount
+    const conn = new TikTokLiveConnection(uniqueId, { enableExtendedGiftInfo: false, fetchRoomInfoOnConnect: false, processInitialData: false });
     const av = u => u?.profilePicture?.url?.[0] || u?.profilePicture?.urlList?.[0] || u?.avatarThumb?.urlList?.[0] || u?.avatarThumb?.url?.[0] || '';
     const nm = u => u?.nickname || u?.uniqueId || 'ẩn danh';
     conn.on(WebcastEvent.CHAT, d => onChat(d.user?.uniqueId || d.user?.userId, nm(d.user), d.comment, av(d.user)));
@@ -200,6 +289,7 @@ function onControl(m){
     case 'mo': broadcast({ t:'mo1' }); break;
     case 'chant': chant(); break;
     case 'say': if (m.text) say(String(m.text).slice(0, 400), { tag:'say' }); break;
+    case 'proxyKey': ttsProxy.setKey(m.key); break;
     case 'settings':
       applySettings(m.settings || {});
       scheduleChant(); broadcast({ t:'settings', settings, cap: capacity() }); break;
@@ -254,9 +344,14 @@ function setBots(on, n, pace){
 //  • no TikTok password, cookie or session is ever used or stored; only public room events are read
 const HOST = process.env.HOST || '127.0.0.1';
 const MIME = { '.html':'text/html; charset=utf-8', '.js':'text/javascript', '.css':'text/css', '.json':'application/json',
-  '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
-const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`]);
+  '.png':'image/png', '.jpg':'image/jpeg', '.webp':'image/webp', '.mp3':'audio/mpeg', '.wav':'audio/wav', '.svg':'image/svg+xml', '.ico':'image/x-icon' };
+// localtest.me is public DNS that always resolves to 127.0.0.1; TikTok LIVE Studio's Link source rejects localhost/IP URLs
+const ALLOWED_HOSTS = new Set([`localhost:${PORT}`, `127.0.0.1:${PORT}`, `[::1]:${PORT}`, `localtest.me:${PORT}`]);
 const okHost = h => ALLOWED_HOSTS.has(String(h || '').toLowerCase());
+// Cloudflare quick tunnel (cloudflared tunnel --url http://localhost:3000) for LIVE Studio's Link source:
+// the public host only gets the read-only overlay (page, assets, voice files, overlay socket), never the control panel
+const isTunnelHost = h => /^[a-z0-9-]+\.trycloudflare\.com$/.test(String(h || '').toLowerCase());
+const isOverlayPath = p => p === '/live/overlay.html' || p.startsWith('/assets/') || p.startsWith('/live/tts/');
 const SEP = path.sep;
 function resolveStatic(urlPath){
   let p = urlPath === '/' ? '/live/control.html' : urlPath;
@@ -268,9 +363,11 @@ function resolveStatic(urlPath){
   return file;
 }
 const server = http.createServer((req, res) => {
-  if (!okHost(req.headers.host)) { res.writeHead(421).end('wrong host'); return; }
+  const tunnel = isTunnelHost(req.headers.host);
+  if (!okHost(req.headers.host) && !tunnel) { res.writeHead(421).end('wrong host'); return; }
   if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405).end(); return; }
   let p; try { p = decodeURIComponent(new URL(req.url, 'http://x').pathname); } catch { res.writeHead(400).end(); return; }
+  if (tunnel && !isOverlayPath(p)) { res.writeHead(404).end('not found'); return; }
   const file = resolveStatic(p);
   if (!file) { res.writeHead(404).end('not found'); return; }
   fs.stat(file, (err, st) => {
@@ -283,6 +380,10 @@ const server = http.createServer((req, res) => {
 });
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024,
   verifyClient: ({ origin, req }) => {
+    if (isTunnelHost(req.headers.host)) {                       // public tunnel: overlay sockets only, from the tunnel page itself
+      if (new URL(req.url, 'http://x').searchParams.get('role') === 'control') return false;
+      try { return !origin || new URL(origin).host === String(req.headers.host).toLowerCase(); } catch { return false; }
+    }
     if (!okHost(req.headers.host)) return false;
     if (!origin) return true;                                   // OBS / non-browser clients send no Origin
     try { return okHost(new URL(origin).host); } catch { return false; }
@@ -291,10 +392,19 @@ function broadcast(msg, only){ const s = JSON.stringify(msg); for (const c of ws
 wss.on('connection', (ws, req) => {
   ws.role = new URL(req.url, 'http://x').searchParams.get('role') === 'control' ? 'control' : 'overlay';
   ws.send(JSON.stringify(snapshot()));
-  if (ws.role === 'control') ws.send(JSON.stringify({ t:'logs', lines: log }));
+  if (ws.role === 'control') { ws.send(JSON.stringify({ t:'logs', lines: log })); ws.send(JSON.stringify(ttsProxy.status())); }
   ws.on('message', buf => {
     if (ws.role !== 'control') return;                          // overlays only listen
     try { const m = JSON.parse(buf); if (m && m.t === 'ctl') onControl(m); } catch (e) { addLog('Lệnh lỗi: ' + e.message); }
   });
 });
 server.listen(PORT, HOST, () => addLog(`Server chạy tại http://localhost:${PORT}  ·  Bảng điều khiển: http://localhost:${PORT}/live/control.html  ·  Overlay: http://localhost:${PORT}/live/overlay.html`));
+// localhost / localtest.me also resolve to ::1, and some embedded browsers (TikTok LIVE Studio) don't fall back to IPv4:
+// forward IPv6 loopback to the IPv4 listener (still loopback-only, nothing reachable from the LAN)
+if (HOST === '127.0.0.1') net.createServer(c => {
+  const u = net.connect(PORT, '127.0.0.1'); c.pipe(u).pipe(c);
+  c.on('error', () => u.destroy()); u.on('error', () => c.destroy());
+}).on('error', () => {}).listen(PORT, '::1');
+// one bad event must not take the whole LIVE down: log it and keep serving
+process.on('uncaughtException', e => addLog('Lỗi (đã bỏ qua): ' + (e?.stack || e)));
+process.on('unhandledRejection', e => addLog('Lỗi (đã bỏ qua): ' + (e?.stack || e)));

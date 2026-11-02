@@ -165,6 +165,9 @@ function showChant(text){ document.getElementById('chantText').textContent=text;
 let AC=null, master=null, musicGain=null, sfx=null, settings={ music:true, mo:true, moBpm:52 };
 const TRACKS=['/assets/music/music1.mp3','/assets/music/music2.mp3']; let trackIdx=Math.floor(Math.random()*TRACKS.length), musicEl=null;
 document.getElementById('unmute').onclick = e => { e.currentTarget.remove(); startAudio(); };
+// ?autoplay=1 for OBS / LIVE Studio link sources, which allow sound without a click
+// (deferred: startAudio() rings bell(), whose state is declared further down)
+if (new URLSearchParams(location.search).has('autoplay')) setTimeout(() => { document.getElementById('unmute')?.remove(); startAudio(); AC.resume().catch(()=>{}); });
 function startAudio(){
   AC = new (window.AudioContext||window.webkitAudioContext)();
   master = AC.createGain(); master.gain.value=.9; master.connect(AC.destination);
@@ -215,7 +218,7 @@ function hearts(v,n){ for (let i=0;i<Math.min(6,n);i++) petals.push({x:v.x+(Math
 /* ======================= server link ======================= */
 let ws=null;
 function connect(){
-  ws = new WebSocket(`ws://${location.host}/ws?role=overlay`);
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?role=overlay`);
   const st=document.getElementById('conn');
   ws.onopen=()=>{ st.textContent=''; };
   ws.onclose=()=>{ st.textContent='mất kết nối server… đang thử lại'; setTimeout(connect,2000); };

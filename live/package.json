@@ -4,8 +4,11 @@
   "private": true,
   "type": "module",
   "description": "TikTok LIVE overlay server for Chánh Điện Tịnh Tâm",
-  "scripts": { "start": "node server.mjs" },
+  "scripts": {
+    "start": "node server.mjs"
+  },
   "dependencies": {
+    "https-proxy-agent": "9.1.0",
     "msedge-tts": "2.1.1",
     "tiktok-live-connector": "2.5.0",
     "ws": "8.18.0"
